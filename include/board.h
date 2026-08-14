@@ -86,7 +86,70 @@ const char *const AP_SSID = "BC250 Switch Setup";
 // is confirmed working on this board.
 #define AP_TX_POWER WIFI_POWER_8_5dBm
 
+//*******  WiFi station (Home Assistant)  ***************
+
+// TX power for station mode. Kept separate from AP_TX_POWER because the two are
+// never active at once (the SoftAP only exists in setup mode, station mode only
+// in normal mode), so they can be tuned independently.
+//
+// Station mode is the first time this board ever transmits at full power. It has
+// a known RF/power design flaw and runs with CONFIG_ESP_BROWNOUT_DET_LVL=7, so
+// if `esp_reset_reason()` starts reporting BROWNOUT or PWR_GLITCH after
+// associating, step this down to WIFI_POWER_8_5dBm.
+#define STA_TX_POWER WIFI_POWER_19_5dBm
+
+// How often to retry association while disconnected. WiFi.setAutoReconnect()
+// handles most cases; this is the backstop that re-issues WiFi.begin().
+const unsigned long WIFI_RETRY_MS = 20000;
+
+// How often to retry the MQTT broker while disconnected. ArduinoHA only attempts
+// a connection from inside HAMqtt::loop(), so simply not calling loop() gates the
+// attempt — see MQTT_CONNECT_TIMEOUT_MS.
+const unsigned long MQTT_RETRY_MS = 20000;
+
+// Bound on a single blocking TCP connect to the broker. PubSubClient defaults to
+// 15s, which would stall the loop long enough to miss button presses and to trip
+// the BOOT_TIMEOUT_MS watchdog. At 2s the worst case is ~2s of missed GPIO5
+// sampling once per MQTT_RETRY_MS, and only while the broker is unreachable.
+const uint16_t MQTT_CONNECT_TIMEOUT_MS = 2000;
+
+// Diagnostic sensors (heap, uptime, RSSI) publish at most this often.
+const unsigned long HA_DIAG_PUBLISH_MS = 30000;
+
+// The sense voltage changes on nearly every loop, so publishing it unthrottled
+// would emit ~1000 msg/s. Publish only on a meaningful change, or as a keepalive.
+const uint32_t       HA_SENSE_DELTA_MV   = 100;
+const unsigned long  HA_SENSE_PUBLISH_MS = 30000;
+
+// Floor on the interval between sense publishes. A delta threshold alone is NOT
+// a rate limit: a signal that oscillates with an amplitude wider than
+// HA_SENSE_DELTA_MV crosses it on every flip and publishes at loop rate. That is
+// not hypothetical — an unconnected TPMS1 pin swings ~56mV to ~205mV and pushed
+// this to ~1 msg/s. This bounds the worst case regardless of the signal.
+const unsigned long  HA_SENSE_MIN_INTERVAL_MS = 2000;
+
 //*******  BLE wake  ***************
+
+// BLE scan duty cycle. The C3 has a single radio shared between WiFi and BLE, so
+// the scan that is affordable when BLE is the only user is not affordable once a
+// WiFi station is associated: a 50%-duty scan starves the WiFi MAC and shows up
+// as association churn and latency.
+//
+// SOLO is today's behaviour, used verbatim when no WiFi is configured, so a
+// device with no network keeps exactly the wake latency it has always had.
+// COEX drops to ~15% duty once WiFi is in play. A controller advertising every
+// 30-100ms still lands many detections inside BLE_PRESENCE_TIMEOUT_MS at 15%,
+// so the cost is wake *latency*, not the feature itself.
+const uint16_t BLE_SCAN_INTERVAL_SOLO_MS = 160;  // ~50% duty, no WiFi
+const uint16_t BLE_SCAN_WINDOW_SOLO_MS   = 80;
+const uint16_t BLE_SCAN_INTERVAL_COEX_MS = 320;  // ~15% duty, WiFi associated
+const uint16_t BLE_SCAN_WINDOW_COEX_MS   = 48;
+
+// Escape hatch. The BLE wake only ever acts in STATE_OFF, so the scan is dead
+// weight while the machine is ON. If coexistence still churns at COEX duty, set
+// this true to stop the scan entirely outside STATE_OFF and hand the radio to
+// WiFi whenever the machine is up.
+const bool     BLE_SCAN_ONLY_WHEN_OFF    = false;
 
 // The bound controller's BLE MAC is configured via the setup portal and stored
 // in NVS (see config.h: config.wakeAddr). When the machine is OFF and that

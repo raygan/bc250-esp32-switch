@@ -32,9 +32,14 @@
     .dev .nm { flex:1; min-width:0; }
     .dev .nm b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .dev .nm small { color:var(--muted); }
-    .dev .rssi { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .dev .rssi { color:var(--muted); font-size:12px; white-space:nowrap; text-align:right; }
     .row { display:flex; gap:10px; } .row > * { flex:1; }
     .scanning { color:var(--muted); font-size:12px; margin:6px 0; }
+    .title { font-size:15px; font-weight:bold; }
+    .steps { color:var(--muted); font-size:11px; letter-spacing:1px; margin-bottom:10px; }
+    .hint { color:var(--muted); font-size:11px; margin-top:6px; }
+    .summary { font-size:13px; line-height:1.7; margin-top:10px; }
+    .summary .k { color:var(--muted); }
   </style>
 </head>
 <body>
@@ -42,9 +47,10 @@
     <h1>BC250 Switch</h1>
     <div class="sub" id="subtitle">Setup portal</div>
 
-    <!-- Password screen -->
+    <!-- 1. Password -->
     <div class="card hidden" id="screen-pass">
-      <div id="pass-title" style="font-size:15px;font-weight:bold"></div>
+      <div class="steps" id="steps-pass"></div>
+      <div class="title" id="pass-title"></div>
       <label for="pw">Password</label>
       <input id="pw" type="password" autocomplete="new-password" />
       <div id="confirm-wrap">
@@ -55,23 +61,93 @@
       <div class="msg" id="pass-msg"></div>
     </div>
 
-    <!-- Device selection screen -->
+    <!-- 2. WiFi -->
+    <div class="card hidden" id="screen-wifi">
+      <div class="steps" id="steps-wifi"></div>
+      <div class="title">Join a WiFi network</div>
+      <div class="sub" style="margin:6px 0 0">
+        Optional. Needed for Home Assistant; the button works without it.
+      </div>
+      <div class="scanning" id="wifi-state">Loading…</div>
+      <div id="wifi-list"></div>
+      <label for="wifi-ssid">Network name</label>
+      <input id="wifi-ssid" placeholder="SSID (or pick one above)" autocomplete="off" />
+      <label for="wifi-pw">WiFi password</label>
+      <input id="wifi-pw" type="password" autocomplete="off" />
+      <div class="hint" id="wifi-pw-hint"></div>
+      <button id="wifi-btn">Save &amp; continue</button>
+      <div class="row">
+        <button class="secondary" data-back>Back</button>
+        <button class="secondary" data-skip>Skip</button>
+      </div>
+      <div class="msg" id="wifi-msg"></div>
+    </div>
+
+    <!-- 3. MQTT -->
+    <div class="card hidden" id="screen-mqtt">
+      <div class="steps" id="steps-mqtt"></div>
+      <div class="title">Home Assistant broker</div>
+      <div class="sub" style="margin:6px 0 0">
+        Optional. MQTT broker address for auto-discovery.
+      </div>
+      <label for="mq-host">Broker host</label>
+      <input id="mq-host" placeholder="192.168.1.10" autocomplete="off" />
+      <label for="mq-port">Port</label>
+      <input id="mq-port" inputmode="numeric" placeholder="1883" autocomplete="off" />
+      <label for="mq-user">Username</label>
+      <input id="mq-user" placeholder="(optional)" autocomplete="off" />
+      <label for="mq-pw">Password</label>
+      <input id="mq-pw" type="password" autocomplete="off" />
+      <div class="hint" id="mq-pw-hint"></div>
+      <button id="mqtt-btn">Save &amp; continue</button>
+      <div class="row">
+        <button class="secondary" data-back>Back</button>
+        <button class="secondary" data-skip>Skip</button>
+      </div>
+      <div class="msg" id="mqtt-msg"></div>
+    </div>
+
+    <!-- 4. Controller -->
     <div class="card hidden" id="screen-dev">
-      <div style="font-size:15px;font-weight:bold">Select your controller</div>
-      <div class="sub" style="margin:6px 0 0">Turn the controller on so it appears below.</div>
+      <div class="steps" id="steps-dev"></div>
+      <div class="title">Select your controller</div>
+      <div class="sub" style="margin:6px 0 0">
+        Optional. Turn the controller on so it appears below.
+      </div>
       <div class="scanning" id="scan-state">Scanning…</div>
       <div id="dev-list"></div>
       <label for="manual">Or enter a MAC manually</label>
-      <input id="manual" placeholder="aa:bb:cc:dd:ee:ff" />
-      <button id="save-btn" disabled>Bind controller &amp; finish</button>
+      <input id="manual" placeholder="aa:bb:cc:dd:ee:ff" autocomplete="off" />
+      <button id="save-btn">Save &amp; continue</button>
+      <div class="row">
+        <button class="secondary" data-back>Back</button>
+        <button class="secondary" data-skip>Skip</button>
+      </div>
       <div class="msg" id="dev-msg"></div>
+    </div>
+
+    <!-- 5. Done -->
+    <div class="card hidden" id="screen-done">
+      <div class="steps" id="steps-done"></div>
+      <div class="title">Finish setup</div>
+      <label for="dev-name">Device name (shown in Home Assistant)</label>
+      <input id="dev-name" placeholder="BC250" autocomplete="off" />
+      <div class="summary" id="summary"></div>
+      <button id="finish-btn">Save &amp; reboot</button>
+      <div class="row">
+        <button class="secondary" data-back>Back</button>
+      </div>
+      <div class="msg" id="done-msg"></div>
     </div>
   </div>
 
   <script>
+    const SCREENS = ["pass", "wifi", "mqtt", "dev", "done"];
+    let current = "pass";
     let token = null;
-    let selected = null;
+    let selected = null;      // bound controller MAC, or null
     let pollTimer = null;
+    let settings = {};
 
     const $ = (id) => document.getElementById(id);
 
@@ -88,12 +164,61 @@
       return data;
     }
 
-    function show(screen) {
-      $("screen-pass").classList.toggle("hidden", screen !== "pass");
-      $("screen-dev").classList.toggle("hidden", screen !== "dev");
+    // --- Screen navigation ---
+    function show(name) {
+      current = name;
+      for (const s of SCREENS) {
+        $("screen-" + s).classList.toggle("hidden", s !== name);
+      }
+      const i = SCREENS.indexOf(name);
+      $("steps-" + name).textContent = "STEP " + (i + 1) + " OF " + SCREENS.length;
+      // Back off the first settings screen would mean re-entering the password,
+      // which just re-POSTs it for no gain. Hide it there.
+      const back = $("screen-" + name).querySelector("[data-back]");
+      if (back) back.classList.toggle("hidden", i <= 1);
+      if (name === "dev") startDevPoll(); else stopDevPoll();
+      if (name === "done") renderSummary();
+      window.scrollTo(0, 0);
+    }
+    const goNext = () => show(SCREENS[SCREENS.indexOf(current) + 1]);
+    const goBack = () => show(SCREENS[SCREENS.indexOf(current) - 1]);
+
+    document.querySelectorAll("[data-back]").forEach((b) => (b.onclick = goBack));
+    document.querySelectorAll("[data-skip]").forEach((b) => (b.onclick = goNext));
+
+    function rssiBars(r) {
+      if (r >= -55) return "▂▄▆█";
+      if (r >= -67) return "▂▄▆";
+      if (r >= -80) return "▂▄";
+      return "▂";
     }
 
-    // --- Password screen ---
+    // Build a picker row without ever touching innerHTML. Both the BLE names and
+    // the WiFi SSIDs below are attacker-chosen strings — anyone in radio range
+    // can name a network "<img onerror=...>" — so they are only ever inserted as
+    // text nodes, never parsed as markup.
+    function makeRow(titleText, subText, rssi, key) {
+      const el = document.createElement("div");
+      el.className = "dev";
+      el.dataset.key = key;
+
+      const nm = document.createElement("div");
+      nm.className = "nm";
+      const b = document.createElement("b");
+      b.textContent = titleText;
+      const small = document.createElement("small");
+      small.textContent = subText;
+      nm.append(b, small);
+
+      const rs = document.createElement("div");
+      rs.className = "rssi";
+      rs.append(rssiBars(rssi), document.createElement("br"), rssi + " dBm");
+
+      el.append(nm, rs);
+      return el;
+    }
+
+    // --- 1. Password ---
     let creating = true;
     function initPassScreen(passwordSet) {
       creating = !passwordSet;
@@ -116,7 +241,8 @@
         const path = creating ? "/api/password" : "/api/login";
         const data = await api(path, "POST", { password: pw });
         token = data.token;
-        gotoDeviceScreen();
+        await loadSettings();
+        goNext();
       } catch (e) {
         msg.className = "msg err"; msg.textContent = e.message;
       } finally {
@@ -124,18 +250,121 @@
       }
     };
 
-    // --- Device screen ---
-    function gotoDeviceScreen() {
-      show("dev");
+    // Prefill every later screen from the device's stored settings. Passwords are
+    // never returned, only the *Set booleans — see the sentinel note below.
+    async function loadSettings() {
+      settings = await api("/api/settings");
+      $("wifi-ssid").value = settings.wifiSsid || "";
+      $("mq-host").value   = settings.mqttHost || "";
+      $("mq-port").value   = settings.mqttPort || 1883;
+      $("mq-user").value   = settings.mqttUser || "";
+      $("dev-name").value  = settings.deviceName || "";
+      selected = settings.wakeAddr || null;
+      $("manual").value = selected || "";
+      $("wifi-pw-hint").textContent = settings.wifiPassSet
+        ? "A password is saved. Leave blank to keep it; clear it and save to remove it."
+        : "Leave blank for an open network.";
+      $("mq-pw-hint").textContent = settings.mqttPassSet
+        ? "A password is saved. Leave blank to keep it; clear it and save to remove it."
+        : "Leave blank if the broker allows anonymous access.";
+      loadWifiList();
+    }
+
+    // Password sentinel (mirrors the firmware side):
+    //   untouched field -> omit the key   -> device keeps the stored password
+    //   touched, empty  -> send ""        -> device clears it
+    //   touched, filled -> send the value -> device replaces it
+    let wifiPwTouched = false, mqPwTouched = false;
+    $("wifi-pw").oninput = () => (wifiPwTouched = true);
+    $("mq-pw").oninput = () => (mqPwTouched = true);
+
+    // --- 2. WiFi ---
+    // The list is a snapshot taken before the AP came up; a live rescan would
+    // knock this browser off the AP, so refreshing it means re-entering setup.
+    async function loadWifiList() {
+      try {
+        const data = await api("/api/wifi/scan");
+        const list = (data.networks || []).sort((a, b) => b.rssi - a.rssi);
+        $("wifi-state").textContent = list.length
+          ? list.length + " network(s) found at startup"
+          : "No networks found — enter one manually.";
+        const box = $("wifi-list");
+        box.textContent = "";
+        for (const n of list) {
+          const el = makeRow(n.ssid, n.open ? "open" : "secured", n.rssi, n.ssid);
+          el.onclick = () => {
+            $("wifi-ssid").value = n.ssid;
+            $("wifi-pw").focus();
+            refreshWifiSel();
+          };
+          box.appendChild(el);
+        }
+        refreshWifiSel();
+      } catch (e) {
+        $("wifi-state").textContent = "Scan unavailable: " + e.message;
+      }
+    }
+
+    function refreshWifiSel() {
+      const v = $("wifi-ssid").value;
+      $("wifi-list").querySelectorAll(".dev").forEach((el) => {
+        el.classList.toggle("sel", el.dataset.key === v && v !== "");
+      });
+    }
+    $("wifi-ssid").oninput = refreshWifiSel;
+
+    $("wifi-btn").onclick = async () => {
+      const msg = $("wifi-msg");
+      msg.className = "msg";
+      const body = { ssid: $("wifi-ssid").value.trim() };
+      if (wifiPwTouched) body.password = $("wifi-pw").value;
+      try {
+        $("wifi-btn").disabled = true;
+        await api("/api/wifi", "POST", body);
+        settings.wifiSsid = body.ssid;
+        if (wifiPwTouched) settings.wifiPassSet = $("wifi-pw").value.length > 0;
+        goNext();
+      } catch (e) {
+        msg.className = "msg err"; msg.textContent = e.message;
+      } finally {
+        $("wifi-btn").disabled = false;
+      }
+    };
+
+    // --- 3. MQTT ---
+    $("mqtt-btn").onclick = async () => {
+      const msg = $("mqtt-msg");
+      msg.className = "msg";
+      const host = $("mq-host").value.trim();
+      const port = parseInt($("mq-port").value, 10) || 1883;
+      if (host && (port < 1 || port > 65535)) {
+        msg.className = "msg err"; msg.textContent = "Port must be 1–65535."; return;
+      }
+      const body = { host, port, user: $("mq-user").value.trim() };
+      if (mqPwTouched) body.password = $("mq-pw").value;
+      try {
+        $("mqtt-btn").disabled = true;
+        await api("/api/mqtt", "POST", body);
+        settings.mqttHost = host;
+        settings.mqttPort = port;
+        settings.mqttUser = body.user;
+        if (mqPwTouched) settings.mqttPassSet = $("mq-pw").value.length > 0;
+        goNext();
+      } catch (e) {
+        msg.className = "msg err"; msg.textContent = e.message;
+      } finally {
+        $("mqtt-btn").disabled = false;
+      }
+    };
+
+    // --- 4. Controller ---
+    function startDevPoll() {
+      if (pollTimer) return;
       pollDevices();
       pollTimer = setInterval(pollDevices, 2000);
     }
-
-    function rssiBars(r) {
-      if (r >= -55) return "▂▄▆█";
-      if (r >= -67) return "▂▄▆";
-      if (r >= -80) return "▂▄";
-      return "▂";
+    function stopDevPoll() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
 
     async function pollDevices() {
@@ -146,17 +375,13 @@
           ? "Scanning… " + list.length + " device(s) seen"
           : "Scanning… (no devices yet)";
         const box = $("dev-list");
-        box.innerHTML = "";
+        box.textContent = "";
         for (const d of list) {
-          const el = document.createElement("div");
-          el.className = "dev" + (selected === d.addr ? " sel" : "");
-          el.innerHTML =
-            '<div class="nm"><b>' + (d.name || "(unknown)") + "</b>" +
-            "<small>" + d.addr + "</small></div>" +
-            '<div class="rssi">' + rssiBars(d.rssi) + "<br>" + d.rssi + " dBm</div>";
-          el.onclick = () => { selected = d.addr; $("manual").value = ""; refreshSel(); };
+          const el = makeRow(d.name || "(unknown)", d.addr, d.rssi, d.addr);
+          el.onclick = () => { selected = d.addr; $("manual").value = d.addr; refreshSel(); };
           box.appendChild(el);
         }
+        refreshSel();
       } catch (e) {
         $("scan-state").textContent = "Scan error: " + e.message;
       }
@@ -164,33 +389,80 @@
 
     $("manual").oninput = () => {
       const v = $("manual").value.trim().toLowerCase();
-      selected = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(v) ? v : null;
+      // Empty is valid: it un-binds the controller.
+      selected = v === "" ? null : (/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(v) ? v : null);
       refreshSel();
     };
 
     function refreshSel() {
-      $("save-btn").disabled = !selected;
-      document.querySelectorAll(".dev").forEach((el) => {
-        const addr = el.querySelector("small").textContent;
-        el.classList.toggle("sel", addr === selected);
+      // Read the MAC off the dataset rather than scraping it back out of the
+      // rendered text — the text is untrusted and may not round-trip.
+      $("dev-list").querySelectorAll(".dev").forEach((el) => {
+        el.classList.toggle("sel", el.dataset.key === selected);
       });
     }
 
     $("save-btn").onclick = async () => {
       const msg = $("dev-msg");
       msg.className = "msg";
+      const raw = $("manual").value.trim().toLowerCase();
+      if (raw !== "" && !/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(raw)) {
+        msg.className = "msg err";
+        msg.textContent = "Not a valid MAC. Clear the field to un-bind.";
+        return;
+      }
       try {
         $("save-btn").disabled = true;
-        await api("/api/ble/select", "POST", { addr: selected });
-        await api("/api/finish", "POST", {});
-        if (pollTimer) clearInterval(pollTimer);
-        msg.className = "msg ok";
-        msg.textContent = "Bound " + selected + ". Rebooting into normal mode…";
-        $("scan-state").textContent = "";
-        $("dev-list").innerHTML = "";
+        await api("/api/ble/select", "POST", { addr: raw });
+        settings.wakeAddr = raw;
+        goNext();
       } catch (e) {
         msg.className = "msg err"; msg.textContent = e.message;
+      } finally {
         $("save-btn").disabled = false;
+      }
+    };
+
+    // --- 5. Done ---
+    function renderSummary() {
+      const box = $("summary");
+      box.textContent = "";
+      const rows = [
+        ["WiFi", settings.wifiSsid || "disabled"],
+        ["Broker", settings.mqttHost
+          ? settings.mqttHost + ":" + (settings.mqttPort || 1883)
+          : "disabled"],
+        ["Controller", settings.wakeAddr || "none"],
+      ];
+      for (const [k, v] of rows) {
+        const line = document.createElement("div");
+        const key = document.createElement("span");
+        key.className = "k";
+        key.textContent = k + ": ";
+        line.append(key, document.createTextNode(v));
+        box.appendChild(line);
+      }
+      if (settings.wifiSsid && !settings.mqttHost) {
+        const note = document.createElement("div");
+        note.className = "hint";
+        note.textContent = "No broker set — the device will join WiFi but won't appear in Home Assistant.";
+        box.appendChild(note);
+      }
+    }
+
+    $("finish-btn").onclick = async () => {
+      const msg = $("done-msg");
+      msg.className = "msg";
+      try {
+        $("finish-btn").disabled = true;
+        await api("/api/device", "POST", { name: $("dev-name").value.trim() });
+        await api("/api/finish", "POST", {});
+        stopDevPoll();
+        msg.className = "msg ok";
+        msg.textContent = "Saved. Rebooting into normal mode…";
+      } catch (e) {
+        msg.className = "msg err"; msg.textContent = e.message;
+        $("finish-btn").disabled = false;
       }
     };
 
