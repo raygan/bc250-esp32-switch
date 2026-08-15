@@ -151,10 +151,14 @@ pio run -t uploadfs   # web UI filesystem
 
 - **WiFi TX power**: these ESP32-C3 *mini* boards have an RF/power quirk
   ([arduino-esp32 #6551](https://github.com/espressif/arduino-esp32/issues/6551)) where
-  the SoftAP is invisible at full power. The portal sets `WIFI_POWER_8_5dBm`
-  (`AP_TX_POWER` in [include/board.h](include/board.h)) to work around it. Station mode
-  has its own `STA_TX_POWER` (default `WIFI_POWER_19_5dBm`); if the reset reason on boot
-  starts reporting `BROWNOUT` or `PWR_GLITCH` after it joins a network, step that down.
+  the radio is unusable at full power. Both the SoftAP (`AP_TX_POWER`) and station
+  mode (`STA_TX_POWER`) therefore run at `WIFI_POWER_8_5dBm`
+  (in [include/board.h](include/board.h)). At full power the symptom is *not* a
+  brownout — there are no resets at all — it is a silent failure to work: the portal
+  is invisible, and station mode never completes association, logging
+  `disconnected, reason=2` (`AUTH_EXPIRE`) forever. Severity varies between physical
+  boards, so one unit working at 19.5 dBm says nothing about the next. See
+  [docs/baseline.md](docs/baseline.md) for the measurements.
 - **Radio coexistence**: WiFi and BLE share one radio. Once an SSID is configured the
   BLE scan drops from ~50 % to ~15 % duty (`BLE_SCAN_*_COEX_MS` in
   [include/board.h](include/board.h)) so it doesn't starve the WiFi MAC — controller
@@ -162,3 +166,8 @@ pio run -t uploadfs   # web UI filesystem
   original ~50 % duty is used unchanged.
 - Serial debug runs over USB-CDC at **115200** baud.
 - Pin assignments and all timing constants live in [include/board.h](include/board.h).
+- **Every "off" is a hard rail cut.** The controller drives `PS_ON#` directly and has
+  no channel into the running OS, so the HA switch and the 5 s button hold yank power
+  rather than requesting a shutdown. A shutdown started *inside* the OS is handled
+  cleanly — the ESP sees TPMS1 drop and follows the board down. Plans for a graceful
+  path are in [docs/future-work.md](docs/future-work.md).

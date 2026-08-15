@@ -35,7 +35,10 @@ silently-dropped one is what would approach the bound.
 ## Verified on hardware
 
 - **WiFi STA at 19.5 dBm** — associates, `txpwr=78`, RSSI −44 to −70. No brownout:
-  reset reason stayed `USB` across every reboot. **No TX-power reduction needed.**
+  reset reason stayed `USB` across every reboot. ~~No TX-power reduction
+  needed.~~ **That conclusion was wrong — see "TX power" below.** It generalised
+  from a single physical board; the wired board cannot associate at all at
+  19.5 dBm.
 - **Association stability** — `connected #1` with zero further transitions across
   several 45 s captures.
 - **DNS avoidance** — an IP-literal broker is detected without a lookup.
@@ -63,19 +66,66 @@ have been silently dropped at the default. `mqtt.setBufferSize(512)` in
 adding entities or a longer device name pushes these up — re-check if entities
 start disappearing from HA.
 
+## TX power — the 19.5 dBm default was wrong
+
+On the wired board, station mode at `WIFI_POWER_19_5dBm` **never associates**. It
+emits `[WIFI] disconnected, reason=2` (`AUTH_EXPIRE`) continuously — measured
+unbroken for 200 s, with the 20 s backstop re-issuing `WiFi.begin()` to no
+effect. Dropping to `WIFI_POWER_8_5dBm` fixes it outright:
+
+```
+[WIFI] connecting to '<ssid>' (txpwr=34)
+[WIFI] got ip <addr>
+[WIFI] connected #1 rssi=-71
+```
+
+First attempt, no retries. This is the same RF design flaw that already forced
+`AP_TX_POWER` down (arduino-esp32 #6551): at full power the transmit signal is
+distorted enough that the AP never hears a clean auth response, so *lowering*
+power is what restores the link.
+
+Two things worth remembering:
+
+- **The predicted symptom was wrong.** `board.h` warned to step this down if
+  `esp_reset_reason()` started reporting BROWNOUT or PWR_GLITCH. There were no
+  resets at all — the reset reason stayed clean and the loop ran throughout. A
+  silent failure to associate is the tell, not a reset.
+- **Severity varies between physical units.** The devkit associates happily at
+  19.5 dBm. That proved nothing about the next board, and treating one sample as
+  a settled result cost most of an evening's debugging.
+
+RSSI on the wired board runs −68 to −74 at 8.5 dBm. Workable but not generous;
+if the link proves marginal, try intermediate powers (11/13 dBm) rather than
+assuming higher is better.
+
+## Verified on the wired board
+
+- **End-to-end HA control** — appears in HA on connect, powers the BC250 on from
+  the HA switch, and reports board power back. The full path works.
+- **8 s hold-to-portal**, twice, including re-entering settings on a device that
+  was already configured.
+- **Settings survive reflashing** — firmware upload erases `0x0–0x4fff`,
+  `0x8000–0x8fff`, `0xe000–0xffff` and `0x10000+`, leaving NVS at
+  `0x9000–0xdfff` untouched. WiFi credentials persisted across every flash.
+- **LWT / availability** — an unplugged device's `avty_t` goes to `offline` on
+  the broker. Observed on the retained topics of the devkit after it was
+  disconnected.
+
 ## Not yet verified — needs hardware not currently attached
 
-- Button: tap-on, 5 s hold-off, 8 s hold-to-portal, and escape-from-setup.
+- Button: tap-on, 5 s hold-off, and escape-from-setup.
 - BLE: controller bind, wake-on-presence, the post-power-off cooldown.
-- Real power switching and TPMS1-driven shutdown detection.
+- TPMS1-driven shutdown detection (`STATE_ON` following the board down).
 - **Phase 3 step 3, the coexistence A/B** — needs a bound controller. Cold wake
   timings (×3) must be captured at SOLO params *before* comparing against COEX,
   or the comparison is unfalsifiable.
 - **Phase 3 step 5**, the NimBLE leak check — needs a bound controller so a scan
   is actually running. The `setMaxResults(0)` fix is verified by code inspection
   only (passive scan reaches `m_callbackSent >= 2`, so the erase path at
-  `NimBLEScan.cpp:343` does fire).
-- LWT / `unavailable` on power loss.
+  `NimBLEScan.cpp:343` does fire). Partial evidence: 293 consecutive heartbeats
+  with a scan running showed a single distinct `heap` value — but the bound
+  controller was not advertising, so the result-accumulation path where a leak
+  would live was never exercised.
 
 ## Pre-existing quirks (not introduced by this work)
 
@@ -96,3 +146,43 @@ it never threatens the hysteresis — but its amplitude exceeds
 produced ~1 msg/s. That is what motivated `HA_SENSE_MIN_INTERVAL_MS`; a delta
 threshold is not a rate limit. Re-measure once TPMS1 is actually wired: a driven
 line should be quiet enough to fall back to the 30 s keepalive.
+
+**Resolved.** On the wired board (below) TPMS1 reads **1–5 mV** with the BC250
+off, a ~4 mV band against a 100 mV threshold. The artefact was purely the
+floating pin. `HA_SENSE_MIN_INTERVAL_MS` is now belt-and-braces rather than
+load-bearing — keep it, since it costs nothing and bounds the worst case if the
+line ever gets noisy under load, but expect `sense_mv` to publish on the 30 s
+keepalive in normal operation.
+
+## Wired board — 44:b1:76:1a:48:64
+
+A second ESP32-C3, soldered to the button and connected to a BC250, with a
+controller already bound (`f4:6a:d7:16:b9:86`). Flashed 2026-08-14. Its NVS
+carried only `forceSetup` and `wakeAddr` from the previous firmware — no
+`passHash` — so WiFi/MQTT are unconfigured on it and it must be taken through
+the portal before it appears in HA.
+
+Idle in `STATE_OFF`, WiFi disabled, BLE scanning at SOLO params, 24 consecutive
+heartbeats:
+
+| | value |
+|---|---|
+| `sense` | 1–5 mV, `low` |
+| `heap` | 179,460 B — **identical on every sample** |
+| `loopMax` | 1,143–1,386 µs |
+
+Two things this establishes:
+
+- **The optional-feature guarantee holds on real hardware.** With no SSID
+  configured the firmware logs `station mode disabled` and never brings up WiFi;
+  the board runs button-and-BLE only, exactly as the pre-change build did.
+- **A byte-identical heap across 24 samples with a scan running** is the first
+  real evidence for the `setMaxResults(0)` fix (Phase 3 step 5), which until now
+  was verified only by code inspection. It is not yet the multi-hour check the
+  plan asks for, and note the scan is finding nothing — the bound controller was
+  not advertising. The leak, if any, is in the result-accumulation path, so the
+  check only becomes meaningful with the controller powered on and discoverable.
+
+`loopMax` here is not comparable to the 700–780 µs Phase 0 figure: that baseline
+had no BLE scan running. Treat 1,150 µs as the new no-WiFi reference for a board
+that is actively scanning.

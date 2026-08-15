@@ -92,11 +92,21 @@ const char *const AP_SSID = "BC250 Switch Setup";
 // never active at once (the SoftAP only exists in setup mode, station mode only
 // in normal mode), so they can be tuned independently.
 //
-// Station mode is the first time this board ever transmits at full power. It has
-// a known RF/power design flaw and runs with CONFIG_ESP_BROWNOUT_DET_LVL=7, so
-// if `esp_reset_reason()` starts reporting BROWNOUT or PWR_GLITCH after
-// associating, step this down to WIFI_POWER_8_5dBm.
-#define STA_TX_POWER WIFI_POWER_19_5dBm
+// This was WIFI_POWER_19_5dBm, on the strength of one devkit that associated
+// fine at full power. The wired board does not: at 19.5 dBm it never completes
+// association at all, emitting `disconnected, reason=2` (AUTH_EXPIRE) forever.
+// The same RF design flaw behind AP_TX_POWER (arduino-esp32 #6551) distorts the
+// transmit signal badly enough that the AP never hears a clean auth response, so
+// *lowering* the power is what fixes connectivity. At 8.5 dBm the same board
+// associates on the first attempt at rssi -71.
+//
+// Note the symptom is NOT the brownout this comment used to predict: there are
+// no resets at all, `esp_reset_reason()` stays clean, and the loop keeps running
+// throughout. Do not go looking for BROWNOUT/PWR_GLITCH as the tell — a silent
+// failure to associate at full power is the tell. Severity varies between
+// physical units, so a board that works at 19.5 dBm proves nothing about the
+// next one.
+#define STA_TX_POWER WIFI_POWER_8_5dBm
 
 // How often to retry association while disconnected. WiFi.setAutoReconnect()
 // handles most cases; this is the backstop that re-issues WiFi.begin().
