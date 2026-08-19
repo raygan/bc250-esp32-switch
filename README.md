@@ -31,7 +31,9 @@ button-and-BLE only, exactly as it did before. Configuring WiFi but not MQTT joi
 network without appearing in Home Assistant. The button remains the primary control and
 works standalone in every configuration.
 
-Be aware that the ESP32 cannot perform a *soft* power off. Power On is equivalent to a single power button press. Power Off is equivalent to a 5 second button hold to force a power off. I recommend shutting down via a controller or other method.
+Be aware that the ESP32 cannot perform a *soft* power off. It drives the PSU's `PS_ON#` line directly and has no channel into the running OS, so Power On energises the rail and the board boots because it now has power, while Power Off cuts that rail outright — the equivalent of holding an ATX power button for 5 seconds. Neither one asks the OS to do anything.
+
+Shutting down from inside the OS is the clean path, and it is handled properly: the ESP sees `TPMS1` drop and releases the PSU on its own. Reserve the HA switch and the 5 second button hold for a machine that is already wedged.
 
 ## Wiring
 
