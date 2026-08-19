@@ -16,6 +16,23 @@ button — plus optional "turn on when I pick up my controller" via Bluetooth.
   auto-discovery as a switch plus power/state/signal sensors.
 - **WiFi setup portal**: configure the bound controller from a phone — no reflashing.
 
+## What this fork adds
+
+Upstream ([Thunkar/bc250-esp32-switch](https://github.com/Thunkar/bc250-esp32-switch)) provides everything above except Home Assistant. If you don’t need network/smarthome control, use the original repo. This fork adds:
+- Joining an existing WiFi network
+- MQTT with auto-discovery
+- Additional screens in the setup portal to enter wifi and MQTT credentials
+
+MQTT enables the BC-250 to appear as a device in Home Assistant, which allows you to power on and off the PSU and see current power status. With some Home Assistant automation, this allows you to do things like power on the BC-250 from a voice assistant, or perform smart home automations when it powers on or off.
+
+**Every new field is optional and independently skippable.** A device with no SSID
+stored never brings up WiFi at all — it logs `station mode disabled` and runs
+button-and-BLE only, exactly as it did before. Configuring WiFi but not MQTT joins the
+network without appearing in Home Assistant. The button remains the primary control and
+works standalone in every configuration.
+
+Be aware that the ESP32 cannot perform a *soft* power off. Power On is equivalent to a single power button press. Power Off is equivalent to a 5 second button hold to force a power off. I recommend shutting down via a controller or other method.
+
 ## Wiring
 
 The ESP32-C3 is permanently powered from the ATX connector's **5 V standby**, so it
