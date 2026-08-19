@@ -12,7 +12,28 @@ button — plus optional "turn on when I pick up my controller" via Bluetooth.
 - **Boot watchdog**: if the board doesn't come up within 10 s, the PSU is released.
 - **BLE controller wake** (optional): when a bound controller (e.g. an 8BitDo) powers
   on, the machine powers on with it.
+- **Home Assistant** (optional): joins your WiFi and appears in HA over MQTT with
+  auto-discovery as a switch plus power/state/signal sensors.
 - **WiFi setup portal**: configure the bound controller from a phone — no reflashing.
+
+## What this fork adds
+
+Upstream ([Thunkar/bc250-esp32-switch](https://github.com/Thunkar/bc250-esp32-switch)) provides everything above except Home Assistant. If you don’t need network/smarthome control, use the original repo. This fork adds:
+- Joining an existing WiFi network
+- MQTT with auto-discovery
+- Additional screens in the setup portal to enter wifi and MQTT credentials
+
+MQTT enables the BC-250 to appear as a device in Home Assistant, which allows you to power on and off the PSU and see current power status. With some Home Assistant automation, this allows you to do things like power on the BC-250 from a voice assistant, or perform smart home automations when it powers on or off.
+
+**Every new field is optional and independently skippable.** A device with no SSID
+stored never brings up WiFi at all — it logs `station mode disabled` and runs
+button-and-BLE only, exactly as it did before. Configuring WiFi but not MQTT joins the
+network without appearing in Home Assistant. The button remains the primary control and
+works standalone in every configuration.
+
+Be aware that the ESP32 cannot perform a *soft* power off. It drives the PSU's `PS_ON#` line directly and has no channel into the running OS, so Power On energises the rail and the board boots because it now has power, while Power Off cuts that rail outright — the equivalent of holding an ATX power button for 5 seconds. Neither one asks the OS to do anything.
+
+Shutting down from inside the OS is the clean path, and it is handled properly: the ESP sees `TPMS1` drop and releases the PSU on its own. Reserve the HA switch and the 5 second button hold for a machine that is already wedged.
 
 ## Wiring
 
@@ -94,8 +115,46 @@ Hold the button ≥ 8 s while off (or on first use) to start the portal:
 
 1. Connect to the open WiFi network **`BC250 Switch Setup`** and open `http://192.168.4.1`.
 2. Create a password.
-3. Pick your controller from the live BLE scan (or enter its MAC).
-4. Finish — the device reboots into normal operation.
+3. **WiFi** — pick your network from the list captured at startup, or type one in.
+4. **MQTT** — your broker's host, port and credentials.
+5. **Controller** — pick it from the live BLE scan, or enter its MAC.
+6. **Finish** — name the device, review, and reboot into normal operation.
+
+Only the password is required. **Every later step can be skipped**, and each is
+independent: no WiFi means the device runs exactly as it always has, on the button
+alone. Skipping just MQTT joins the network without appearing in Home Assistant.
+
+To clear something later, blank the field and save — an empty SSID disables WiFi, an
+empty broker host disables MQTT, and an empty MAC un-binds the controller. Password
+fields left blank keep whatever is already stored; clear one and save to remove it.
+
+The WiFi list is scanned once at startup, before the setup AP exists — a live rescan
+would take the AP off-channel and drop your phone's connection. To refresh it, re-enter
+setup mode.
+
+## Home Assistant
+
+With WiFi and a broker configured, the device publishes MQTT discovery and shows up
+automatically. Entities:
+
+| Entity | Type | Meaning |
+|---|---|---|
+| Power | switch | On whenever the PSU is asserted (booting counts as on) |
+| Board power | binary sensor | `TPMS1` — whether the board itself is actually up |
+| State | sensor | `OFF` / `BOOTING` / `ON` |
+| Controller present | binary sensor | Bound controller is advertising (only if one is bound) |
+| Sense voltage | sensor | Raw `TPMS1` reading in mV |
+| WiFi signal, Free heap, Uptime | sensors | Diagnostics, published every 30 s |
+| Restart, Setup mode | buttons | Reboot, or reboot into the setup portal |
+
+**The switch reports reality, not intent.** Commands from HA run through exactly the
+same power path as the physical button, including the boot watchdog. So if you turn the
+switch on and the board never asserts `TPMS1`, the 10 s watchdog cuts the PSU and **the
+switch flips itself back off**. That is correct behaviour — the machine genuinely did
+not come up — but it looks like a bug if you aren't expecting it.
+
+If the broker is unreachable, the device keeps working normally on the button; it just
+retries the broker every 20 s in the background.
 
 ## Build & flash
 
@@ -111,7 +170,23 @@ pio run -t uploadfs   # web UI filesystem
 
 - **WiFi TX power**: these ESP32-C3 *mini* boards have an RF/power quirk
   ([arduino-esp32 #6551](https://github.com/espressif/arduino-esp32/issues/6551)) where
-  the SoftAP is invisible at full power. The portal sets `WIFI_POWER_8_5dBm`
-  (`AP_TX_POWER` in [include/board.h](include/board.h)) to work around it.
+  the radio is unusable at full power. Both the SoftAP (`AP_TX_POWER`) and station
+  mode (`STA_TX_POWER`) therefore run at `WIFI_POWER_8_5dBm`
+  (in [include/board.h](include/board.h)). At full power the symptom is *not* a
+  brownout — there are no resets at all — it is a silent failure to work: the portal
+  is invisible, and station mode never completes association, logging
+  `disconnected, reason=2` (`AUTH_EXPIRE`) forever. Severity varies between physical
+  boards, so one unit working at 19.5 dBm says nothing about the next. See
+  [docs/baseline.md](docs/baseline.md) for the measurements.
+- **Radio coexistence**: WiFi and BLE share one radio. Once an SSID is configured the
+  BLE scan drops from ~50 % to ~15 % duty (`BLE_SCAN_*_COEX_MS` in
+  [include/board.h](include/board.h)) so it doesn't starve the WiFi MAC — controller
+  wake still works, it just takes a little longer to notice. With no SSID configured the
+  original ~50 % duty is used unchanged.
 - Serial debug runs over USB-CDC at **115200** baud.
 - Pin assignments and all timing constants live in [include/board.h](include/board.h).
+- **Every "off" is a hard rail cut.** The controller drives `PS_ON#` directly and has
+  no channel into the running OS, so the HA switch and the 5 s button hold yank power
+  rather than requesting a shutdown. A shutdown started *inside* the OS is handled
+  cleanly — the ESP sees TPMS1 drop and follows the board down. Plans for a graceful
+  path are in [docs/future-work.md](docs/future-work.md).

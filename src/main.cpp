@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <esp_system.h>
 #include "board.h"
 #include "config.h"
+#include "ha.h"
 #include "portal.h"
 
 // The ESP32-C3 is permanently powered from the ATX connector (5VSB), so it runs
@@ -53,6 +55,13 @@ static unsigned long          bleInhibitUntil = 0;  // wakes ignored until this
 // --- Misc timers ---
 static unsigned long bootStart    = 0;
 static unsigned long lastHeartbeat = 0;
+
+// Worst-case normalLoop() duration since the last heartbeat, in microseconds.
+// The loop has to sample GPIO5 often enough to catch a ~150ms button tap, so
+// anything that blocks — WiFi association, a DNS lookup, a TCP connect to a
+// dead broker — shows up here first. Reset every heartbeat so a single stall
+// doesn't mask the steady state.
+static unsigned long loopMaxUs = 0;
 
 static const char *stateName(PowerState s) {
   switch (s) {
@@ -137,7 +146,12 @@ class WakeScanCallbacks : public NimBLEScanCallbacks {
 
 static WakeScanCallbacks wakeScanCallbacks;
 
-static void startBleScan() {
+static bool bleScanning = false;
+
+// coexWithWifi selects the low-duty scan parameters. Called as
+// startBleScan(wifiConfigured()), so a device with no WiFi keeps today's
+// behaviour exactly — same interval, same window, same wake latency.
+static void startBleScan(bool coexWithWifi) {
   if (config.wakeAddr.isEmpty()) {
     Serial.println("[BLE ] no controller bound; BLE wake disabled "
                    "(hold button 8s while OFF to configure)");
@@ -147,10 +161,48 @@ static void startBleScan() {
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&wakeScanCallbacks, true);  // true = report duplicates
   scan->setActiveScan(false);  // passive: we only need the address, saves power
-  scan->setInterval(160);      // ms
-  scan->setWindow(80);         // ms (<= interval; ~50% duty)
-  scan->start(0, false);       // 0 = scan continuously
-  Serial.printf("[BLE ] scanning for controller %s\n", config.wakeAddr.c_str());
+
+  // Do not accumulate scan results. NimBLE defaults m_maxResults to 0xFF, and
+  // its cap check only applies for values in 1..0xFE, so by default NOTHING is
+  // capped: every new advertiser is heap-allocated onto a vector that is only
+  // cleared on DISC_COMPLETE — an event that never fires for a continuous
+  // start(0, false) scan. With BLE privacy addresses rotating every ~15 minutes,
+  // that grows without bound for as long as the machine sits OFF. Setting 0
+  // switches on the erase-after-callback path instead (NimBLEScan.cpp:343),
+  // which a passive scan does reach because it fires both onDiscovered and
+  // onResult on the first report. The portal's active scan is left alone: it
+  // accumulates deliberately to populate the picker, and is short-lived.
+  scan->setMaxResults(0);
+
+  uint16_t interval = coexWithWifi ? BLE_SCAN_INTERVAL_COEX_MS
+                                   : BLE_SCAN_INTERVAL_SOLO_MS;
+  uint16_t window   = coexWithWifi ? BLE_SCAN_WINDOW_COEX_MS
+                                   : BLE_SCAN_WINDOW_SOLO_MS;
+  scan->setInterval(interval);
+  scan->setWindow(window);       // <= interval
+  scan->start(0, false);         // 0 = scan continuously
+  bleScanning = true;
+  Serial.printf("[BLE ] scanning for controller %s (%s: %u/%u ms, ~%u%% duty)\n",
+                config.wakeAddr.c_str(), coexWithWifi ? "coex" : "solo",
+                interval, window, (unsigned)(100UL * window / interval));
+}
+
+// Stop/restart the scan around the machine being ON, used only when
+// BLE_SCAN_ONLY_WHEN_OFF is set. The wake decision only ever fires in
+// STATE_OFF, so the scan is dead weight while the machine is up; releasing the
+// radio hands the whole duty cycle back to WiFi.
+static void setBleScanActive(bool active) {
+  if (config.wakeAddr.isEmpty() || active == bleScanning) return;
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  if (active) {
+    scan->start(0, false);
+    bleScanning = true;
+    Serial.println("[BLE ] scan resumed (machine OFF)");
+  } else {
+    scan->stop();
+    bleScanning = false;
+    Serial.println("[BLE ] scan paused (machine not OFF)");
+  }
 }
 
 // Persist a setup request and reboot into the WiFi portal.
@@ -207,10 +259,34 @@ static void normalBegin() {
                 stateName(state), boardSenseStable ? "UP" : "DOWN",
                 config.wakeAddr.isEmpty() ? "(none)" : config.wakeAddr.c_str());
 
-  startBleScan();
+  startBleScan(wifiConfigured());
+  haBegin();
 }
 
 static bool g_setupMode = false;
+
+static const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_EXT:      return "EXT";
+    case ESP_RST_SW:       return "SW";
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:  return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT:      return "WDT";
+    case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO:     return "SDIO";
+#if ESP_IDF_VERSION_MAJOR >= 5
+    case ESP_RST_USB:      return "USB";        // host toggled DTR/RTS
+    case ESP_RST_JTAG:     return "JTAG";
+    case ESP_RST_EFUSE:    return "EFUSE";
+    case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";  // supply glitch detector
+    case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+#endif
+    default:               return "UNKNOWN";
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -220,6 +296,13 @@ void setup() {
     delay(10);
   }
   Serial.println();
+
+  // Log why we rebooted. This board runs at CONFIG_ESP_BROWNOUT_DET_LVL=7 and
+  // has a known RF/power design flaw, so a WiFi transmit that browns the rail
+  // out is a real possibility — BROWNOUT here is the evidence for it, and
+  // distinguishes it from a crash (PANIC) or an intentional restart (SW).
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.printf("[INIT] reset reason: %s (%d)\n", resetReasonName(rr), (int)rr);
 
   loadConfig();
 
@@ -236,6 +319,32 @@ void setup() {
 
 static void normalLoop() {
   unsigned long now = millis();
+
+  // --- Drain any command from Home Assistant ---
+  // MQTT callbacks fire inside mqtt.loop() with no access to this iteration's
+  // `now`, so they only park a command here. Running it through the same
+  // powerOn()/powerOff() the button uses means the boot watchdog and the BLE
+  // cooldown arm identically whatever the trigger was — there is no second code
+  // path that could bypass them.
+  switch (haTakeCommand()) {
+    case HA_CMD_POWER_ON:
+      if (state == STATE_OFF) powerOn("Home Assistant switch on", now);
+      break;
+    case HA_CMD_POWER_OFF:
+      if (state != STATE_OFF) powerOff("Home Assistant switch off", now);
+      break;
+    case HA_CMD_ENTER_SETUP:
+      enterSetupMode("Home Assistant setup button");
+      break;
+    case HA_CMD_RESTART:
+      Serial.println("[ACT ] Home Assistant restart button -> restarting");
+      delay(50);
+      ESP.restart();
+      break;
+    case HA_CMD_NONE:
+    default:
+      break;
+  }
 
   // --- Sample & debounce inputs ---
   uint32_t senseMv;
@@ -317,16 +426,42 @@ static void normalLoop() {
       break;
   }
 
+  // Optional: release the radio while the machine isn't OFF. The BLE wake only
+  // acts in STATE_OFF, so nothing is lost except during that window.
+  if (BLE_SCAN_ONLY_WHEN_OFF) {
+    setBleScanActive(state == STATE_OFF);
+  }
+
   // --- Heartbeat ---
   if (now - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = now;
-    Serial.printf("[HB  ] state=%s board=%s btn=%s ble=%s | sense: %umV (%s)\n",
+    Serial.printf("[HB  ] state=%s board=%s btn=%s ble=%s | sense: %umV (%s) "
+                  "| heap=%u loopMax=%luus | wifi=%s rssi=%d mqtt=%s\n",
                   stateName(state),
                   boardSenseStable ? "UP" : "DOWN",
                   buttonStable ? "down" : "up",
                   blePresent ? "present" : "absent",
-                  senseMv, boardRaw ? "high" : "low");
+                  senseMv, boardRaw ? "high" : "low",
+                  (unsigned)ESP.getFreeHeap(), loopMaxUs,
+                  haWifiConnected() ? "up" : "down", (int)haRssi(),
+                  haMqttConnected() ? "up" : "down");
+    loopMaxUs = 0;
   }
+
+  // --- Home Assistant ---
+  // LAST in the iteration on purpose: HA then observes the state this pass
+  // produced, so a switch command and the state it causes are reported in the
+  // same iteration and the entity never bounces back to its old value.
+  HaState hs;
+  hs.stateName  = stateName(state);
+  hs.powerOn    = (state != STATE_OFF);   // BOOTING reports ON
+  hs.boardUp    = boardSenseStable;
+  hs.blePresent = blePresent;
+  hs.bleActive  = !config.wakeAddr.isEmpty();
+  hs.senseMv    = senseMv;
+  // A blocking connect attempt inside the 10s boot watchdog could stall long
+  // enough to trip a spurious "boot timed out", so don't allow one while BOOTING.
+  haLoop(now, hs, state != STATE_BOOTING);
 }
 
 void loop() {
@@ -334,5 +469,11 @@ void loop() {
     portalLoop();
     return;
   }
+  // Time the whole iteration so the heartbeat can report the worst case. The
+  // span excludes this iteration's own reporting, which is what we want: it
+  // measures the input-sampling cadence, not the printf.
+  unsigned long t0 = micros();
   normalLoop();
+  unsigned long span = micros() - t0;
+  if (span > loopMaxUs) loopMaxUs = span;
 }

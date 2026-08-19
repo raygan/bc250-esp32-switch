@@ -37,6 +37,20 @@ static const int       MAX_DEVS = 48;
 static BleDev          devs[MAX_DEVS];
 static portMUX_TYPE    devsMux = portMUX_INITIALIZER_UNLOCKED;
 
+// --- WiFi network list (scanned once, before the AP exists) ---
+// A live scanNetworks() in AP mode takes the SoftAP off-channel for seconds and
+// drops the phone's association, so the list is captured at startup and served
+// from this cache. "Rescan" in the UI is re-enter-setup-and-reboot, not a live
+// scan. Manual SSID entry stays available for hidden networks.
+struct WifiNet {
+  char ssid[33];
+  int  rssi;
+  bool open;
+};
+static const int MAX_NETS = 24;
+static WifiNet   nets[MAX_NETS];
+static int       netCount = 0;
+
 class SetupScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *d) override {
     std::string addrStr = d->getAddress().toString();
@@ -114,6 +128,39 @@ static void serveIndex(AsyncWebServerRequest *req) {
   }
 }
 
+// Scan for access points and cache the result. Must run BEFORE the SoftAP is
+// started — see the WifiNet comment above. Costs ~3s at startup, which is
+// before anyone can have connected to the AP.
+static void scanWifiNetworks() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  netCount = 0;
+  for (int i = 0; i < n && netCount < MAX_NETS; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty()) continue;  // hidden; use manual entry for these
+    int  rssi = WiFi.RSSI(i);
+    bool open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+
+    // Dedupe by SSID, keeping the strongest signal (mesh/repeater networks
+    // advertise the same SSID from several BSSIDs).
+    int found = -1;
+    for (int j = 0; j < netCount; j++) {
+      if (ssid == nets[j].ssid) { found = j; break; }
+    }
+    if (found >= 0) {
+      if (rssi > nets[found].rssi) nets[found].rssi = rssi;
+      continue;
+    }
+    strncpy(nets[netCount].ssid, ssid.c_str(), sizeof(nets[netCount].ssid) - 1);
+    nets[netCount].ssid[sizeof(nets[netCount].ssid) - 1] = 0;
+    nets[netCount].rssi = rssi;
+    nets[netCount].open = open;
+    netCount++;
+  }
+  WiFi.scanDelete();
+  Serial.printf("[PORTAL] wifi scan: %d found, %d cached\n", n, netCount);
+}
+
 // --- Endpoint handlers ---
 
 static void handleStatus(AsyncWebServerRequest *req) {
@@ -124,6 +171,120 @@ static void handleStatus(AsyncWebServerRequest *req) {
   String out;
   serializeJson(doc, out);
   req->send(200, "application/json", out);
+}
+
+// Current settings for the UI to prefill. Authed, unlike /api/status: this
+// exposes the network the device is joined to and the broker it talks to.
+// Passwords are NEVER returned — only whether one is stored.
+static void handleGetSettings(AsyncWebServerRequest *req) {
+  if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
+  JsonDocument doc;
+  doc["wifiSsid"]    = config.wifiSsid;
+  doc["wifiPassSet"] = config.wifiPass.length() > 0;
+  doc["mqttHost"]    = config.mqttHost;
+  doc["mqttPort"]    = mqttPort();
+  doc["mqttUser"]    = config.mqttUser;
+  doc["mqttPassSet"] = config.mqttPass.length() > 0;
+  doc["deviceName"]  = config.deviceName;
+  doc["wakeAddr"]    = config.wakeAddr;
+  String out;
+  serializeJson(doc, out);
+  req->send(200, "application/json", out);
+}
+
+static void handleWifiScan(AsyncWebServerRequest *req) {
+  if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>();
+  for (int i = 0; i < netCount; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["ssid"] = nets[i].ssid;
+    o["rssi"] = nets[i].rssi;
+    o["open"] = nets[i].open;
+  }
+  String out;
+  serializeJson(doc, out);
+  req->send(200, "application/json", out);
+}
+
+// Password sentinel, shared by /api/wifi and /api/mqtt:
+//
+//   key ABSENT            -> keep whatever is already stored
+//   key PRESENT and ""    -> clear the stored password
+//   key PRESENT, non-""   -> replace
+//
+// This is what lets the UI show "password saved" and submit the form without
+// ever round-tripping the secret. Do NOT "simplify" this to `o["password"] |
+// config.wifiPass` — that collapses the clear case into the keep case, and a
+// user who deletes their password would silently keep the old one.
+static bool keyPresent(JsonObject o, const char *key) {
+  return !o[key].isNull();
+}
+
+static void handleWifi(AsyncWebServerRequest *req, JsonVariant &json) {
+  if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
+  JsonObject o = json.as<JsonObject>();
+  String ssid = o["ssid"] | "";
+  ssid.trim();
+
+  if (ssid.length() > 32) { sendJsonError(req, 400, "ssid too long"); return; }
+
+  // An empty SSID disables station mode entirely; drop the password with it so
+  // no orphaned secret is left in NVS.
+  if (ssid.isEmpty()) {
+    setWifiCreds("", "");
+    Serial.println("[PORTAL] wifi cleared (station mode disabled)");
+    req->send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+
+  String pass = keyPresent(o, "password") ? (o["password"] | "") : config.wifiPass;
+  if (pass.length() > 63) { sendJsonError(req, 400, "password too long"); return; }
+
+  setWifiCreds(ssid, pass);
+  Serial.printf("[PORTAL] wifi set: ssid='%s' pass=%s\n", ssid.c_str(),
+                pass.length() ? "(set)" : "(open)");
+  req->send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleMqtt(AsyncWebServerRequest *req, JsonVariant &json) {
+  if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
+  JsonObject o = json.as<JsonObject>();
+  String host = o["host"] | "";
+  host.trim();
+
+  // An empty host disables MQTT; clear the credentials with it.
+  if (host.isEmpty()) {
+    setMqttSettings("", mqttPort(), "", "");
+    Serial.println("[PORTAL] mqtt cleared (disabled)");
+    req->send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  if (host.length() > 64) { sendJsonError(req, 400, "host too long"); return; }
+
+  uint32_t port = o["port"] | (uint32_t)mqttPort();
+  if (port < 1 || port > 65535) { sendJsonError(req, 400, "invalid port"); return; }
+
+  String user = o["user"] | "";
+  String pass = keyPresent(o, "password") ? (o["password"] | "") : config.mqttPass;
+
+  setMqttSettings(host, (uint16_t)port, user, pass);
+  Serial.printf("[PORTAL] mqtt set: %s:%u user=%s pass=%s\n", host.c_str(),
+                (unsigned)port, user.length() ? user.c_str() : "(none)",
+                pass.length() ? "(set)" : "(none)");
+  req->send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleDevice(AsyncWebServerRequest *req, JsonVariant &json) {
+  if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
+  JsonObject o = json.as<JsonObject>();
+  String name = o["name"] | "";
+  name.trim();
+  if (name.length() > 32) { sendJsonError(req, 400, "name too long"); return; }
+  setDeviceName(name);
+  Serial.printf("[PORTAL] device name: '%s'\n",
+                name.length() ? name.c_str() : haDeviceName());
+  req->send(200, "application/json", "{\"ok\":true}");
 }
 
 static void handlePassword(AsyncWebServerRequest *req, JsonVariant &json) {
@@ -195,6 +356,15 @@ static void handleBleSelect(AsyncWebServerRequest *req, JsonVariant &json) {
   if (!authed(req)) { sendJsonError(req, 401, "unauthorized"); return; }
   JsonObject o = json.as<JsonObject>();
   String addr = o["addr"] | "";
+  addr.trim();
+  // An empty address un-binds the controller (BLE wake off). Without this there
+  // is no way to clear a binding once made — the only escape was an NVS wipe.
+  if (addr.isEmpty()) {
+    setWakeAddr("");
+    Serial.println("[PORTAL] controller un-bound (BLE wake disabled)");
+    req->send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
   if (addr.length() != 17) {  // "aa:bb:cc:dd:ee:ff"
     sendJsonError(req, 400, "invalid address");
     return;
@@ -230,6 +400,11 @@ void portalBegin() {
     Serial.println("[PORTAL] WARNING: SPIFFS mount failed");
   }
 
+  // Scan while we're still in STA mode and nothing is associated. Doing this
+  // after softAP() would knock any connected phone off the AP for seconds.
+  scanWifiNetworks();
+
+  WiFi.mode(WIFI_AP);
   bool ok = WiFi.softAP(AP_SSID);  // open network
   // These C3 mini boards have an RF/power design flaw (arduino-esp32 #6551):
   // at full TX power the SoftAP emits no usable beacons. Lowering TX power makes
@@ -252,11 +427,19 @@ void portalBegin() {
   scan->setWindow(45);     // ms (~9% duty, leaves the radio free for WiFi)
   scan->start(0, false);
 
+  // /api/status is deliberately unauthenticated (the UI needs it before login)
+  // and already leaks wakeAddr. Everything below is authed — don't extend the
+  // unauthenticated surface with network names or broker addresses.
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/ble/devices", HTTP_GET, handleBleDevices);
   server.on("/api/finish", HTTP_POST, handleFinish);
   server.addHandler(new AsyncCallbackJsonWebHandler("/api/password", handlePassword));
   server.addHandler(new AsyncCallbackJsonWebHandler("/api/login", handleLogin));
+  server.addHandler(new AsyncCallbackJsonWebHandler("/api/wifi", handleWifi));
+  server.addHandler(new AsyncCallbackJsonWebHandler("/api/mqtt", handleMqtt));
+  server.addHandler(new AsyncCallbackJsonWebHandler("/api/device", handleDevice));
   server.addHandler(new AsyncCallbackJsonWebHandler("/api/ble/select", handleBleSelect));
 
   server.on("/", HTTP_GET, serveIndex);
